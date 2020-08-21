@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
@@ -108,31 +109,45 @@ func RunInvocations(sess *session.Session, client ssmiface.SSMAPI, wg *sync.Wait
 		CommandId: commandID,
 	}
 
+	level := sess.Logger.GetLevel()
+
+	// Filter results to only failed commands if the log level is set to only show errors
+	if level == log.ErrorLevel || level == log.FatalLevel {
+		filters := []*ssm.CommandFilter{
+			{
+				Key:   aws.String("Status"),
+				Value: aws.String("Failed"),
+			},
+		}
+		lciInput.SetFilters(filters)
+	}
+
+	processCommandInvocations := func(page *ssm.ListCommandInvocationsOutput, lastPage bool) bool {
+		for _, entry := range page.CommandInvocations {
+			// Fetch the results of our invocation for all provided instances
+			go invocation.GetResult(client, commandID, entry.InstanceId, oc, ec)
+
+			// Wait for results to return until the combined total of results and errors
+			select {
+			case result := <-oc:
+				addInvocationResults(results, sess, result)
+			case err := <-ec:
+				sess.Logger.Error(err)
+			}
+		}
+
+		// Last page, break out
+		if page.NextToken == nil {
+			return false
+		}
+
+		lciInput.SetNextToken(*page.NextToken)
+		return true
+	}
+
 	// Iterate through the details of the invocations returned
-	if err = client.ListCommandInvocationsPages(
-		lciInput,
-		func(page *ssm.ListCommandInvocationsOutput, lastPage bool) bool {
-			for _, entry := range page.CommandInvocations {
-				// Fetch the results of our invocation for all provided instances
-				go invocation.GetResult(client, commandID, entry.InstanceId, oc, ec)
 
-				// Wait for results to return until the combined total of results and errors
-				select {
-				case result := <-oc:
-					addInvocationResults(results, sess, result)
-				case err := <-ec:
-					sess.Logger.Error(err)
-				}
-			}
-
-			// Last page, break out
-			if page.NextToken == nil {
-				return false
-			}
-
-			lciInput.SetNextToken(*page.NextToken)
-			return true
-		}); err != nil {
+	if err = client.ListCommandInvocationsPages(lciInput, processCommandInvocations); err != nil {
 		sess.Logger.Error(fmt.Errorf("Error when calling ListCommandInvocations API\n%v", err))
 	}
 
